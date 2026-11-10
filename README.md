@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/34610270/README.md)
+
 # On-Premise Infrastructure Lab
 
 > **Rocky Linux 서버 4대를 활용한 온프레미스 웹 서비스 구축 및 운영**  
