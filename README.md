@@ -1,4 +1,3 @@
-
 # On-Premise Infrastructure Lab
 
 > **Rocky Linux 서버 4대를 활용한 온프레미스 웹 서비스 구축 및 운영**  
@@ -126,62 +125,57 @@ Prometheus의 `up`은 메트릭 수집 성공 여부를, Blackbox Exporter의 `p
 
 ## 장애 대응 시나리오
 
-이번 프로젝트에서는 서버 프로세스가 실행 중이어도 방화벽이나 데이터베이스 연결 문제로 실제 웹서비스가 정상적으로 동작하지 않을 수 있다는 점을 확인하고자 했습니다. 장애 발생 후 상태를 확인하고 원인을 좁힌 다음, 설정을 복구하고 서비스 동작을 재검증하는 과정을 기록합니다.
+실제 서비스 환경에서 장애를 재현하고, 상태 확인부터 복구 결과까지 기록했습니다. APP01의 애플리케이션 응답과 DB 연결 상태를 구분해 확인하는 데 중점을 뒀습니다.
 
-> **진행 상태:** Scenario 01은 실제 장애 재현 전 작성한 실습 계획입니다. 아래 예상 결과는 실습 후 실제 출력과 캡처로 교체합니다. Scenario 02는 실제 겪었던 장애를 바탕으로 작성했습니다.
-
-### Scenario 01. DB01 방화벽 차단으로 인한 DB 연결 장애 (재현 예정)
+### Scenario 01. DB01 방화벽 차단으로 인한 DB 연결 장애 (재현 및 검증 완료)
 
 **상황**
 
-WEB01에서 Nginx를 통해 APP01에 요청을 전달하고, APP01이 DB01의 MariaDB(`192.168.144.30:3306`)에 연결하는 구조입니다. APP01에서 DB01로 향하는 DB 접근을 일시적으로 차단해, 애플리케이션 자체는 실행 중이지만 방명록의 데이터 조회·저장이 실패하는 상황을 재현할 계획입니다.
+WEB01의 Nginx가 요청을 APP01로 전달하고, APP01이 DB01의 MariaDB(`192.168.144.30:3306`)에 접속하는 구조입니다. DB01에서 APP01(`192.168.144.20`)의 3306 포트 접근을 5분 동안 일시적으로 차단하여 DB 연결 장애를 재현했습니다. 기존 허용 규칙은 삭제하지 않았습니다.
 
 **탐지**
 
-WEB01에서 APP01의 `/health`와 `/ready`를 각각 확인합니다. `/health`는 앱 프로세스 응답만 확인하지만, `/ready`는 DB 연결 여부까지 확인하므로 DB 연결이 차단되면 두 결과가 다르게 나타날 것으로 예상됩니다.
+APP01에서 `/health`와 `/ready`를 호출해 상태를 비교했습니다. 애플리케이션 자체는 정상 응답했지만, DB 연결 상태를 확인하는 `/ready`에서는 오류가 발생했습니다.
 
-| 점검 대상 | 정상 상태 예상 | DB 접근 차단 시 예상 |
+| 점검 항목 | 차단 시 응답 | 의미 |
 |---|---|---|
-| APP01 `/health` | HTTP 200 | HTTP 200 |
-| APP01 `/ready` | HTTP 200 | HTTP 503 |
-| 방명록 조회·저장 | 정상 | 실패 가능 |
+| `/health` | HTTP `200` · `"status":"ok"` | 애플리케이션 프로세스 정상 |
+| `/ready` | HTTP `503` · `"database":"unavailable"` | DB 연결 실패 |
 
-```bash
-# WEB01에서 실행
-curl -s -o /dev/null -w 'health: %{http_code}\n' http://192.168.144.20:8000/health
-curl -s -o /dev/null -w 'ready: %{http_code}\n' http://192.168.144.20:8000/ready
-```
+![APP01에서 health는 200, ready는 503으로 응답한 화면](screenshots/troubleshooting/02-service-failure.png)
 
 **원인 분석**
 
-DB01의 MariaDB 프로세스와 TCP `3306` 리스닝 상태를 확인하고, APP01에서 DB01로 연결되는 경로 및 방화벽 규칙을 점검합니다. DB 서비스가 실행 중인데 APP01에서만 접근하지 못한다면 DB 자체의 중지와 네트워크 접근 차단을 구분할 수 있습니다.
+장애 재현 전 DB01의 MariaDB 프로세스는 `active` 상태였고 TCP 3306 포트도 리스닝 중이었습니다. DB01의 `firewalld`에는 APP01의 3306 접근을 허용하는 규칙이 있었지만, 테스트를 위해 우선순위 `-100`의 `reject` 규칙을 임시로 추가했습니다. 추가된 규칙이 기존 `accept` 규칙보다 먼저 평가되도록 구성했으며, 실제 DB 연결 실패를 확인했습니다.
 
 ```bash
-# DB01에서 읽기 전용 상태 확인
-sudo systemctl is-active mariadb
-sudo ss -lntp | grep ':3306'
-sudo firewall-cmd --get-active-zones
-sudo firewall-cmd --get-zone-of-interface=ens160
-sudo firewall-cmd --list-all
+# DB01에서 실행한 장애 재현 명령
+sudo firewall-cmd --zone=public \
+  --add-rich-rule='rule family="ipv4" priority="-100" source address="192.168.144.20/32" port port="3306" protocol="tcp" reject' \
+  --timeout=300
+
+sudo firewall-cmd --zone=public --list-rich-rules
 ```
+
+![DB01 방화벽에 임시 reject 규칙이 추가된 화면](screenshots/troubleshooting/01-firewall-block.png)
 
 **복구**
 
-실습에서 추가한 **임시 차단 규칙만 제거**하고 APP01에서 DB01로 다시 접속되는지 확인합니다. 기존 방화벽을 비활성화하거나 모든 포트를 허용하는 방식으로 해결하지 않습니다. 방화벽 Zone과 현재 허용 규칙을 먼저 확인한 뒤, 자동 만료되는 일시적 규칙으로 재현할 계획입니다.
+5분 만료 조건을 둔 임시 차단 규칙이 해제된 뒤 DB01 방화벽 규칙을 다시 확인했습니다. `reject` 규칙은 사라지고, APP01(`192.168.144.20`)의 TCP 3306 접근 허용과 MON01(`192.168.144.40`)의 TCP 9100 접근 허용 규칙은 그대로 남아 있었습니다.
+
+![DB01에서 임시 차단 규칙이 사라지고 기존 허용 규칙만 남은 화면](screenshots/troubleshooting/03-firewall-recovery.png)
 
 **검증**
 
-복구 후 `/health`와 `/ready`가 모두 HTTP 200을 반환하는지 확인하고, 외부 HTTPS 접속에서 테스트 방명록을 작성해 DB에 저장되는지 확인합니다. 실행 과정의 실제 출력과 스크린샷을 추가한 뒤 결과를 기록합니다.
+APP01에서 같은 요청을 다시 실행한 결과 `/health`와 `/ready` 모두 HTTP `200`을 반환했습니다. `/ready`의 `"database":"ok"` 응답으로 DB 연결이 정상 복구된 것을 확인했습니다.
 
-**증빙 이미지 계획 (실습 후 추가)**
+![APP01에서 health와 ready가 모두 200으로 응답한 화면](screenshots/troubleshooting/04-service-recovery.png)
 
-- `screenshots/scenario-01-detection.png`: `/health` 정상 응답과 `/ready` 실패 비교
-- `screenshots/scenario-01-analysis.png`: DB 서비스 실행 상태, 리스닝 포트, 방화벽 규칙
-- `screenshots/scenario-01-recovery.png`: 차단 해제 후 `/ready` 복구 및 DB 저장 확인
+**배운 점**
 
-**확인하려는 점**
+애플리케이션이 실행 중이어도 DB 같은 의존 서비스에 연결하지 못하면 실제 기능은 정상적으로 동작하지 않을 수 있다는 점을 확인했습니다. 장애를 진단할 때 서비스 프로세스 상태와 연결 준비 상태를 구분하고, 방화벽 전체를 해제하기보다 해당 서버 간 통신 규칙을 확인하는 것이 중요하다는 것을 배웠습니다.
 
-서비스 프로세스가 살아 있는 것과 서비스가 정상적으로 요청을 처리할 준비가 된 것은 다를 수 있습니다. 또한 통신 장애를 해결할 때 방화벽을 모두 해제하지 않고 필요한 경로만 허용하는 접근 제어 방식이 중요하다는 점을 검증하고자 합니다.
+> 이번 사례는 실제 운영 중 우연히 발생한 장애가 아니라, 접근 제어와 복구 절차를 확인하기 위해 **의도적으로 재현한 실습**입니다. DB 차단 당시 방명록 작성 실패 화면이나 복구 후 실제 DB 쓰기 테스트는 별도로 캡처하지 않았으므로, 검증 결과는 `/health`·`/ready` 응답과 방화벽 규칙 확인을 기준으로 작성했습니다.
 
 ### Scenario 02. Prometheus 컨테이너 비정상 종료 (실제 발생)
 
@@ -233,7 +227,7 @@ README의 설명과 실제 동작 결과를 연결할 수 있도록 핵심 화�
 | 장애 알림 | Telegram 알림 수신 화면 |
 | 백업·복원 | 백업 파일과 복원 후 데이터 확인 |
 | CI/CD·롤백 | GitHub Actions 성공 및 이전 이미지로 전환한 기록 |
-| 장애 대응 | DB 접근 차단 전·후 응답과 복구 결과 (재현 후 추가) |
+| 장애 대응 | DB01 방화벽 차단 및 APP01 `/ready` HTTP 503 → 200 복구 캡처 확보 |
 
 ## 개선할 부분
 
